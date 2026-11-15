@@ -102,3 +102,51 @@ def save_theme(theme: str) -> None:
     settings = _settings()
     settings.setValue("ui/theme", "dark" if theme == "dark" else "light")
     settings.sync()
+
+
+def load_desktop_opacity() -> float:
+    """桌面课表的不透明度（0.1 ~ 1.0，默认 0.3）。"""
+    raw = _settings().value("desktop/opacity", None)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.3
+    return min(1.0, max(0.1, value))
+
+
+def save_desktop_opacity(value: float) -> None:
+    settings = _settings()
+    try:
+        number = min(1.0, max(0.1, float(value)))
+    except (TypeError, ValueError):
+        number = 0.3
+    settings.setValue("desktop/opacity", round(number, 3))
+    settings.sync()
+
+
+def load_crs_path() -> str:
+    """最近一次保存 / 打开的 .crs 文件路径；未保存过时返回空字符串。"""
+    return str(_settings().value("crs/last_path", "") or "")
+
+
+def save_crs_path(path: str) -> None:
+    settings = _settings()
+    if path:
+        settings.setValue("crs/last_path", path)
+    else:
+        settings.remove("crs/last_path")
+    settings.sync()
+
+
+def load_desktop_enabled() -> bool:
+    """是否启用实验性的「锁定到桌面」功能（默认关闭）。"""
+    raw = _settings().value("desktop/enabled", False)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("true", "1", "yes", "on")
+
+
+def save_desktop_enabled(enabled: bool) -> None:
+    settings = _settings()
+    settings.setValue("desktop/enabled", bool(enabled))
+    settings.sync()

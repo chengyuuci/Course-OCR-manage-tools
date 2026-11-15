@@ -7,7 +7,7 @@ import re
 import threading
 from datetime import date, timedelta
 
-from PyQt5.QtCore import QRectF, QTime, QTimer, Qt
+from PyQt5.QtCore import QPointF, QRectF, QSize, QTime, QTimer, Qt
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QKeySequence, QPainter, QPen
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -26,14 +26,17 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
     QShortcut,
+    QSlider,
     QSpinBox,
     QSplitter,
+    QSystemTrayIcon,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -43,6 +46,8 @@ from PyQt5.QtWidgets import (
 )
 
 from .crashlog import get_log_path
+from .crs import CRS_SUFFIX, default_crs_path, load_crs, save_crs
+from .desktop import DesktopPinWindow, build_tray_icon
 from .excel_parser import parse_excel
 from .exporters import export_ics, export_json, export_xlsx
 from .models import (
@@ -56,9 +61,15 @@ from .models import (
 from .parsing import extract_weeks
 from .pdf_parser import parse_pdf
 from .settings import (
+    load_crs_path,
+    load_desktop_enabled,
+    load_desktop_opacity,
     load_period_times,
     load_reminders,
     load_theme,
+    save_crs_path,
+    save_desktop_enabled,
+    save_desktop_opacity,
     save_period_times,
     save_reminders,
     save_theme,
@@ -369,6 +380,9 @@ class ScheduleEditor(QWidget):
             prev_end = start.addSecs(duration * 60)
 
         area.setWidget(body)
+        # 末尾留一段弹性空白：内容比滚动区矮时（高 DPI 下常见）各行保持自然高度，
+        # 不会被 QGridLayout 拉开成稀疏的表格
+        grid.setRowStretch(periods + 1, 1)
         lay.addWidget(area, 1)
 
         reset_row = QHBoxLayout()
@@ -418,8 +432,54 @@ class ScheduleEditor(QWidget):
         return result
 
 
+class ToggleSwitch(QCheckBox):
+    """胶囊样式的开关：语义仍是 QCheckBox，外观用 QPainter 自绘。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.toggled.connect(self.update)
+        # 隐藏 Qt 自带的方框，只保留自绘的胶囊
+        self.setStyleSheet(
+            "QCheckBox { spacing: 0px; }"
+            "QCheckBox::indicator { width: 0px; height: 0px; }"
+        )
+
+    def sizeHint(self):  # noqa: N802 - Qt 回调
+        return QSize(44, 22)
+
+    def hitButton(self, pos) -> bool:  # noqa: N802 - Qt 回调
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt 回调
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        width, height = 44, 22
+        top = (self.height() - height) / 2.0
+        radius = height / 2.0
+        if self.isChecked():
+            track = QColor("#1E88E5")
+        elif theme.is_dark():
+            track = QColor("#546E7A")
+        else:
+            track = QColor("#B0BEC5")
+        if not self.isEnabled():
+            track.setAlpha(110)
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(track)
+        painter.drawRoundedRect(QRectF(0, top, width, height), radius, radius)
+
+        knob = (height - 6) / 2.0
+        cx = width - 3 - knob if self.isChecked() else 3 + knob
+        painter.setBrush(QColor("#FFFFFF"))
+        painter.drawEllipse(QPointF(cx, top + height / 2.0), knob, knob)
+
+
 class SettingsDialog(QDialog):
-    """设置窗口：作息时间 + 导出提醒 + 外观。"""
+    """设置窗口：作息时间 + 导出提醒 + 外观 + 实验性功能。"""
 
     def __init__(
         self,
@@ -428,11 +488,15 @@ class SettingsDialog(QDialog):
         max_period: int = 12,
         reminders: list[int] | None = None,
         theme_value: str = "light",
+        desktop_opacity: float = 0.3,
+        desktop_enabled: bool = False,
     ):
         super().__init__(parent)
         self.result_period_times: dict[int, tuple[str, str]] | None = None
         self.result_reminders: list[int] = []
         self.result_theme: str = theme.LIGHT
+        self.result_opacity: float = desktop_opacity
+        self.result_desktop_enabled: bool = bool(desktop_enabled)
         self.setWindowTitle("设置")
         self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
 
@@ -478,8 +542,51 @@ class SettingsDialog(QDialog):
         self.theme_combo.addItem("深色（黑）", theme.DARK)
         self.theme_combo.setCurrentIndex(0 if theme_value != theme.DARK else 1)
         tlay.addWidget(self.theme_combo)
+
+        tlay.addSpacing(10)
+        tlay.addWidget(_hint("桌面课表的不透明度（「锁定到桌面」后生效）："))
+        opacity_row = QHBoxLayout()
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(10, 100)
+        self.opacity_slider.setSingleStep(1)
+        self.opacity_slider.setPageStep(5)
+        self.opacity_slider.setValue(int(round(desktop_opacity * 100)))
+        self.opacity_slider.setTickPosition(QSlider.TicksBelow)
+        self.opacity_slider.setTickInterval(10)
+        self.opacity_value = QLabel()
+        self.opacity_value.setFixedWidth(48)
+        self.opacity_slider.valueChanged.connect(
+            lambda v: self.opacity_value.setText(f"{v}%")
+        )
+        self.opacity_value.setText(f"{self.opacity_slider.value()}%")
+        opacity_row.addWidget(self.opacity_slider, 1)
+        opacity_row.addWidget(self.opacity_value)
+        tlay.addLayout(opacity_row)
+        tlay.addWidget(_hint("数值越小越透明：10% 几乎只看得到轮廓，100% 完全不透明。"))
         tlay.addStretch(1)
         tabs.addTab(theme_tab, " 外观 ")
+
+        exp_tab = QWidget()
+        elay = QVBoxLayout(exp_tab)
+        elay.setContentsMargins(16, 16, 16, 16)
+        elay.setSpacing(10)
+        elay.addWidget(_hint("这里的功能还在试验阶段，可能受系统环境影响，默认关闭。"))
+
+        switch_row = QHBoxLayout()
+        self.desktop_switch = ToggleSwitch()
+        self.desktop_switch.setChecked(bool(desktop_enabled))
+        desktop_label = QLabel("启用「锁定到桌面」")
+        desktop_label.setBuddy(self.desktop_switch)
+        switch_row.addWidget(self.desktop_switch)
+        switch_row.addSpacing(10)
+        switch_row.addWidget(desktop_label)
+        switch_row.addStretch(1)
+        elay.addLayout(switch_row)
+
+        elay.addWidget(_hint("开启并保存后，已保存的课表（.crs）才会出现「锁定到桌面」按钮，用来把课表半透明贴在桌面上。"))
+        elay.addWidget(_hint("注意：桌面课表不抢焦点、点击穿透、位于普通窗口之下；若壁纸由动态壁纸软件绘制，图标会被整体压暗一点。"))
+        elay.addStretch(1)
+        tabs.addTab(exp_tab, " 实验性功能 ")
 
         lay.addWidget(tabs, 1)
 
@@ -550,6 +657,8 @@ class SettingsDialog(QDialog):
         self.result_period_times = period_times
         self.result_reminders = reminders
         self.result_theme = self.theme_combo.currentData()
+        self.result_opacity = self.opacity_slider.value() / 100.0
+        self.result_desktop_enabled = self.desktop_switch.isChecked()
         self.accept()
 
 
@@ -929,6 +1038,10 @@ class TimetableApp(QMainWindow):
         self.files: list[str] = []
         self.queue: queue.Queue = queue.Queue()
         self.parsing = False
+        self.crs_path: str | None = None
+        self.desktop_window: DesktopPinWindow | None = None
+        self.tray: QSystemTrayIcon | None = None
+        self._locked = False
 
         self._build_ui()
         self._bind_shortcuts()
@@ -942,8 +1055,13 @@ class TimetableApp(QMainWindow):
         self._log("2. 点击「开始识别」；")
         self._log("3. 双击结果表格中的课程可以修正识别错误；")
         self._log("4. 导出 Excel / JSON / 日历(ICS)。")
+        if load_desktop_enabled():
+            self._log("5. 「保存课表」存成 .crs 后，可点「锁定到桌面」把课表半透明贴在桌面上。")
+        else:
+            self._log("5. 「保存课表」存成 .crs 后会自动记住；需要桌面课表时，先到 设置 → 实验性功能 打开开关。")
         self._log("提示：日历导出以工具栏里的「第 1 周周一」为基准。")
         self._log(f"崩溃日志：{get_log_path()}")
+        self._restore_saved_timetable()
 
     # ------------------------------------------------------------ 构建界面
 
@@ -978,11 +1096,25 @@ class TimetableApp(QMainWindow):
         settings_button = QPushButton("设置")
         settings_button.setToolTip("作息时间与导出提醒设置")
         settings_button.clicked.connect(self.open_settings)
+        self.save_crs_button = QPushButton("保存课表")
+        self.save_crs_button.setToolTip("把当前课表保存为自定义的 .crs 文件")
+        self.save_crs_button.clicked.connect(self.save_crs_file)
+        self.open_crs_button = QPushButton("打开课表")
+        self.open_crs_button.setToolTip("从 .crs 文件打开之前保存的课表")
+        self.open_crs_button.clicked.connect(self.open_crs_file)
+        self.lock_button = QPushButton("锁定到桌面")
+        self.lock_button.setToolTip("把课表以 30% 不透明度固定在桌面最底层，并驻留托盘")
+        self.lock_button.clicked.connect(self.toggle_lock)
+        self.lock_button.hide()
         button_row.addWidget(add_button)
         button_row.addWidget(remove_button)
         button_row.addSpacing(10)
         button_row.addWidget(self.parse_button)
         button_row.addWidget(settings_button)
+        button_row.addSpacing(8)
+        button_row.addWidget(self.save_crs_button)
+        button_row.addWidget(self.open_crs_button)
+        button_row.addWidget(self.lock_button)
 
         separator = QFrame()
         separator.setFrameShape(QFrame.VLine)
@@ -1154,6 +1286,8 @@ class TimetableApp(QMainWindow):
             self.timetable.max_period(),
             load_reminders(),
             load_theme(),
+            load_desktop_opacity(),
+            load_desktop_enabled(),
         )
         if dialog.exec_() != QDialog.Accepted:
             return
@@ -1164,8 +1298,220 @@ class TimetableApp(QMainWindow):
         save_reminders(dialog.result_reminders)
         save_theme(dialog.result_theme)
         theme.apply_theme(QApplication.instance(), dialog.result_theme)
+        save_desktop_opacity(dialog.result_opacity)
+        if self.desktop_window is not None:
+            self.desktop_window.set_opacity(dialog.result_opacity)
+        save_desktop_enabled(dialog.result_desktop_enabled)
+        if not dialog.result_desktop_enabled and self._locked:
+            self._unlock_from_desktop()
+            self._log("「锁定到桌面」已关闭，桌面课表已解除。")
+        self._update_lock_button()
         self._log("设置已保存")
         self.statusBar().showMessage("设置已保存")
+
+    # ------------------------------------------------------------ 课表存档 / 桌面锁定
+
+    def _set_crs_path(self, path: str | None) -> None:
+        """记录当前课表的 .crs 文件，并据此显示或隐藏「锁定到桌面」。"""
+        self.crs_path = path or None
+        save_crs_path(self.crs_path or "")
+        self._update_lock_button()
+
+    def _update_lock_button(self) -> None:
+        available = bool(
+            self.crs_path
+            and os.path.isfile(self.crs_path)
+            and load_desktop_enabled()
+        )
+        if available:
+            self.lock_button.show()
+            self.lock_button.setText("解除锁定" if self._locked else "锁定到桌面")
+        else:
+            self.lock_button.hide()
+
+    def _restore_saved_timetable(self) -> None:
+        """启动时检测上次保存的 .crs；存在则自动载入并显示锁定按钮。"""
+        path = load_crs_path()
+        if (not path or not os.path.isfile(path)) and os.path.isfile(default_crs_path()):
+            # 设置丢失时，回退到应用目录下的默认存档
+            path = default_crs_path()
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            timetable, first_monday = load_crs(path)
+        except Exception as exc:
+            self._log(f"读取已保存的课表失败：{exc}")
+            return
+        if not timetable.courses:
+            return
+        self.timetable = timetable
+        self.grid.set_timetable(timetable)
+        if first_monday:
+            self.week1_edit.setText(first_monday)
+        self._set_crs_path(path)
+        self._refresh_courses()
+        self._log(f"已载入已保存的课表：{path}")
+
+    def save_crs_file(self) -> None:
+        if not self._ensure_courses():
+            return
+        default = self.crs_path or default_crs_path()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存课表", default, f"课表存档 (*{CRS_SUFFIX})"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(CRS_SUFFIX):
+            path += CRS_SUFFIX
+        try:
+            save_crs(self.timetable, self.week1_edit.text().strip(), path)
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", str(exc))
+            return
+        self._set_crs_path(path)
+        self._log(f"课表已保存：{path}")
+        self.statusBar().showMessage(f"课表已保存：{os.path.basename(path)}")
+
+    def open_crs_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开课表", self.crs_path or "", f"课表存档 (*{CRS_SUFFIX})"
+        )
+        if not path:
+            return
+        try:
+            timetable, first_monday = load_crs(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "打开失败", str(exc))
+            return
+        if not timetable.courses:
+            QMessageBox.warning(self, "打开失败", "这个 .crs 文件里没有课程。")
+            return
+        self.timetable = timetable
+        self.grid.set_timetable(timetable)
+        if first_monday:
+            self.week1_edit.setText(first_monday)
+        self._set_crs_path(path)
+        self._refresh_courses()
+        self._sync_desktop()
+        self._log(f"已打开课表：{path}（{len(timetable.courses)} 条课程）")
+        self.statusBar().showMessage(f"已打开：{os.path.basename(path)}")
+
+    def _sync_desktop(self) -> None:
+        """课表内容变化后，若已锁定桌面就同步刷新。"""
+        if self.desktop_window is not None:
+            self.desktop_window.set_timetable(self.timetable)
+
+    def toggle_lock(self) -> None:
+        if self._locked:
+            self._unlock_from_desktop()
+        else:
+            self._lock_to_desktop()
+
+    def _lock_to_desktop(self) -> None:
+        if not load_desktop_enabled():
+            QMessageBox.information(
+                self,
+                "提示",
+                "「锁定到桌面」是实验性功能，请先在 设置 → 实验性功能 中打开开关。",
+            )
+            return
+        if not self.crs_path or not os.path.isfile(self.crs_path):
+            QMessageBox.information(self, "提示", "请先点「保存课表」。")
+            return
+        # 锁定前先写回 .crs，保证桌面显示的是最新内容
+        try:
+            save_crs(self.timetable, self.week1_edit.text().strip(), self.crs_path)
+        except Exception as exc:
+            self._log(f"锁定前保存失败：{exc}")
+        if self.desktop_window is None:
+            self.desktop_window = DesktopPinWindow(self.timetable)
+        else:
+            self.desktop_window.set_timetable(self.timetable)
+        opacity = load_desktop_opacity()
+        self.desktop_window.set_opacity(opacity)
+        self.desktop_window.show_on_screen()
+        self._locked = True
+        self._ensure_tray()
+        self._update_lock_button()
+        percent = int(round(opacity * 100))
+        self._log(f"课表已锁定到桌面（{percent}% 不透明度，位于桌面图标之下）。")
+        self.statusBar().showMessage("课表已固定到桌面")
+        if self.tray is not None:
+            self.tray.showMessage(
+                "课表已固定到桌面",
+                f"课表已半透明贴在桌面图标下面（{percent}% 不透明度），程序驻留在系统托盘。",
+                QSystemTrayIcon.Information,
+                2500,
+            )
+
+    def _unlock_from_desktop(self) -> None:
+        if self.desktop_window is not None:
+            self.desktop_window.hide()
+            self.desktop_window.close()
+            self.desktop_window = None
+        self._locked = False
+        self._update_lock_button()
+        self._log("已解除桌面锁定。")
+        self.statusBar().showMessage("已解除桌面锁定")
+        if self.tray is not None and self.isVisible():
+            self.tray.hide()
+
+    def _ensure_tray(self) -> None:
+        if self.tray is not None:
+            self.tray.show()
+            return
+        tray = QSystemTrayIcon(build_tray_icon(), self)
+        tray.setToolTip("课表识别助手")
+        menu = QMenu(self)
+        show_action = menu.addAction("显示主窗口")
+        show_action.triggered.connect(self._show_from_tray)
+        unlock_action = menu.addAction("解除桌面锁定")
+        unlock_action.triggered.connect(self._unlock_from_desktop)
+        menu.addSeparator()
+        quit_action = menu.addAction("退出")
+        quit_action.triggered.connect(self._quit_app)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._on_tray_activated)
+        self.tray = tray
+        tray.show()
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._show_from_tray()
+
+    def _show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_app(self) -> None:
+        self._locked = False
+        if self.desktop_window is not None:
+            self.desktop_window.close()
+            self.desktop_window = None
+        if self.tray is not None:
+            self.tray.hide()
+        QApplication.instance().quit()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 回调
+        if self._locked:
+            event.ignore()
+            self.hide()
+            self._ensure_tray()
+            if self.tray is not None:
+                self.tray.showMessage(
+                    "课表识别助手",
+                    "程序已最小化到系统托盘，课表仍在桌面显示。",
+                    QSystemTrayIcon.Information,
+                    2500,
+                )
+            return
+        if self.desktop_window is not None:
+            self.desktop_window.close()
+            self.desktop_window = None
+        if self.tray is not None:
+            self.tray.hide()
+        event.accept()
 
     # ------------------------------------------------------------ 识别
 
@@ -1362,6 +1708,7 @@ class TimetableApp(QMainWindow):
                 table.setItem(row, col, item)
         table.setUpdatesEnabled(True)
         self.grid.refresh()
+        self._sync_desktop()
 
     def _conflicts(self) -> list[tuple[int, int]]:
         return find_conflicts(self.timetable.courses)

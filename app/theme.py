@@ -200,36 +200,57 @@ QSplitter::handle { background-color: #3C3C3C; }
 """
 
 
-_arrow_cache: tuple[str, str] | None = None
+_arrow_cache: tuple[float, str, str] | None = None
+
+
+def _screen_ratio() -> float:
+    """主屏的缩放倍数（高 DPI 下用来出清晰的小图标）。"""
+    try:
+        from PyQt5.QtWidgets import QApplication
+
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            return max(1.0, float(screen.devicePixelRatio()))
+    except Exception:
+        pass
+    return 1.0
 
 
 def _ensure_arrows() -> tuple[str, str]:
     """生成深色主题的上/下箭头图标，返回路径；失败时返回 ("", "")。"""
     global _arrow_cache
-    if _arrow_cache is not None:
-        return _arrow_cache
+    ratio = _screen_ratio()
+    if _arrow_cache is not None and _arrow_cache[0] == ratio:
+        return _arrow_cache[1], _arrow_cache[2]
     folder = os.path.join(tempfile.gettempdir(), "TimetableOCR_theme")
-    up = os.path.join(folder, "arrow_up.png")
-    down = os.path.join(folder, "arrow_down.png")
+    tag = "arrow%d" % int(round(ratio * 100))
+    up = os.path.join(folder, tag + "_up.png")
+    down = os.path.join(folder, tag + "_down.png")
     try:
         os.makedirs(folder, exist_ok=True)
         if not (os.path.exists(up) and os.path.exists(down)):
             from PIL import Image, ImageDraw
 
-            size = 20
+            # 按物理像素出图：20 逻辑像素 × 缩放倍数，避免高 DPI 下被放大发糊
+            scale = ratio
+            size = max(10, int(round(20 * scale)))
             color = (224, 224, 224, 255)
             for path, pointing_up in ((up, True), (down, False)):
                 img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
                 draw = ImageDraw.Draw(img)
                 if pointing_up:
-                    draw.polygon([(4, 14), (16, 14), (10, 6)], fill=color)
+                    points = [(4, 14), (16, 14), (10, 6)]
                 else:
-                    draw.polygon([(4, 6), (16, 6), (10, 14)], fill=color)
+                    points = [(4, 6), (16, 6), (10, 14)]
+                draw.polygon(
+                    [(int(round(x * scale)), int(round(y * scale))) for x, y in points],
+                    fill=color,
+                )
                 img.save(path)
-        _arrow_cache = (up, down)
+        _arrow_cache = (ratio, up, down)
     except Exception:
-        _arrow_cache = ("", "")
-    return _arrow_cache
+        _arrow_cache = (ratio, "", "")
+    return _arrow_cache[1], _arrow_cache[2]
 
 
 def _dark_qss() -> str:
