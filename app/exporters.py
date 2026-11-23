@@ -12,6 +12,10 @@ from .models import (
     DAY_NAMES,
     DEFAULT_PERIOD_TIMES,
     DEFAULT_TERM_WEEKS,
+    DEFAULT_WEEK_START,
+    course_date,
+    term_anchor,
+    term_week_of,
 )
 
 _PALETTE = [
@@ -273,19 +277,22 @@ def _duration_before(minutes: int) -> str:
 def export_ics(
     courses: list[Course],
     path: str,
-    first_monday: date | str,
+    first_day: date | str,
     period_times=None,
     reminders: list[int] | None = None,
-) -> tuple[date, int]:
-    """按学期第一周周一生成日历事件，返回 (对齐后的周一, 事件数)。
+    week_start: str = DEFAULT_WEEK_START,
+) -> tuple[date, int, int]:
+    """按「本学期第一天」生成日历事件，返回 (第 1 周起点, 事件数, 跳过数)。
 
-    reminders 为提前分钟数列表时，为每个事件附加对应的多个 DISPLAY 提醒，
-    每个元素在事件开始前相应分钟触发。
+    week_start 决定每周从哪一天开始（周六/周日/周一），第 1 周起点是
+    不晚于「本学期第一天」的那个周首。reminders 为提前分钟数列表时，
+    为每个事件附加对应的多个 DISPLAY 提醒。早于「本学期第一天」的日期
+    会跳过（例如学期周三开始、但课表里有周一课），计入第 3 个返回值。
     """
     period_times = period_times or DEFAULT_PERIOD_TIMES
-    if isinstance(first_monday, str):
-        first_monday = date.fromisoformat(first_monday.strip())
-    first_monday = first_monday - timedelta(days=first_monday.weekday())
+    if isinstance(first_day, str):
+        first_day = date.fromisoformat(first_day.strip())
+    anchor = term_anchor(first_day, week_start)
 
     now_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = [
@@ -298,6 +305,7 @@ def export_ics(
     ]
 
     event_count = 0
+    skipped = 0
     for course in courses:
         weeks = course.weeks or DEFAULT_TERM_WEEKS
         start_text = course.time_start or period_times.get(
@@ -317,16 +325,20 @@ def export_ics(
         if end_dt <= start_dt:
             end_dt = start_dt + timedelta(minutes=45)
 
-        description = f"节次：{_periods_text(course)}；周次：{course.weeks_label}"
+        base_description = f"节次：{_periods_text(course)}；周次：{course.weeks_label}"
         if course.teacher:
-            description += f"；教师：{course.teacher}"
+            base_description += f"；教师：{course.teacher}"
         if not course.weeks:
-            description += "（周次未识别，按 1-16 周导出）"
+            base_description += "（周次未识别，按 1-16 周导出）"
 
         for week in weeks:
-            class_date = first_monday + timedelta(
-                days=(week - 1) * 7 + (course.day - 1)
-            )
+            class_date = course_date(first_day, week, course.day, week_start)
+            if class_date < first_day:
+                skipped += 1
+                continue
+            # 这一天在学期里属于第几周（受「每周第一天」影响，可能与课程周次不同）
+            current_week = term_week_of(class_date, first_day, week_start)
+            description = f"{base_description}；当前周次：第 {current_week} 周"
             dtstart = datetime.combine(class_date, start_clock)
             dtend = datetime.combine(class_date, end_clock)
             if dtend <= dtstart:
@@ -359,4 +371,4 @@ def export_ics(
     content = "\r\n".join(_fold_line(line) for line in lines) + "\r\n"
     with open(path, "w", encoding="utf-8", newline="") as fh:
         fh.write(content)
-    return first_monday, event_count
+    return anchor, event_count, skipped

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 
 DAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
@@ -21,6 +22,45 @@ DEFAULT_PERIOD_TIMES: dict[int, tuple[str, str]] = {
 }
 
 DEFAULT_TERM_WEEKS = list(range(1, 17))
+
+# 「每周第一天」：下拉选项的值（周六 / 周日 / 周一）与 Python weekday() 的对应
+WEEK_START_CHOICES: tuple[tuple[str, str], ...] = (
+    ("sat", "周六"),
+    ("sun", "周日"),
+    ("mon", "周一"),
+)
+WEEK_START_WEEKDAY = {"sat": 5, "sun": 6, "mon": 0}
+DEFAULT_WEEK_START = "mon"
+
+
+def _week_start_weekday(week_start: str) -> int:
+    return WEEK_START_WEEKDAY.get((week_start or DEFAULT_WEEK_START).lower(), 0)
+
+
+def term_anchor(first_day: date, week_start: str = DEFAULT_WEEK_START) -> date:
+    """第 1 周的第一天：不晚于「本学期第一天」的那个「每周第一天」。
+
+    默认周一 + 学期从周一开始时，锚点就是本学期第一天本身。
+    """
+    start = _week_start_weekday(week_start)
+    return first_day - timedelta(days=(first_day.weekday() - start) % 7)
+
+
+def term_week_of(day: date, first_day: date, week_start: str = DEFAULT_WEEK_START) -> int:
+    """某一天属于学期第几周（小于 1 表示还没到第 1 周）。"""
+    anchor = term_anchor(first_day, week_start)
+    return (day - anchor).days // 7 + 1
+
+
+def course_date(
+    first_day: date, week: int, weekday: int, week_start: str = DEFAULT_WEEK_START
+) -> date:
+    """第 week 周、星期 weekday（1=周一 … 7=周日）对应的日期。"""
+    anchor = term_anchor(first_day, week_start)
+    start = _week_start_weekday(week_start)
+    offset = (weekday - 1 - start) % 7
+    return anchor + timedelta(days=(week - 1) * 7 + offset)
+
 
 
 def compress_weeks(weeks: list[int]) -> str:

@@ -4,16 +4,18 @@ from __future__ import annotations
 import os
 import queue
 import re
+import sys
 import threading
 from datetime import date, timedelta
 
-from PyQt5.QtCore import QPointF, QRectF, QSize, QTime, QTimer, Qt
+from PyQt5.QtCore import QDate, QPointF, QRectF, QSize, QTime, QTimer, Qt
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QKeySequence, QPainter, QPen
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDateEdit,
     QDialog,
     QFileDialog,
     QFrame,
@@ -47,32 +49,50 @@ from PyQt5.QtWidgets import (
 
 from .crashlog import get_log_path
 from .crs import CRS_SUFFIX, default_crs_path, load_crs, save_crs
-from .desktop import DesktopPinWindow, build_tray_icon
+from .desktop import (
+    DesktopPinWindow,
+    build_tray_icon,
+    promote_tray_icon,
+    tray_promoted_state,
+    tray_registry_key,
+)
 from .excel_parser import parse_excel
 from .exporters import export_ics, export_json, export_xlsx
 from .models import (
+    DEFAULT_WEEK_START,
+    WEEK_START_CHOICES,
     Course,
     DAY_NAMES,
     DEFAULT_PERIOD_TIMES,
+    DEFAULT_TERM_WEEKS,
     Timetable,
     compress_weeks,
     find_conflicts,
+    term_week_of,
 )
 from .parsing import extract_weeks
 from .pdf_parser import parse_pdf
 from .settings import (
     load_crs_path,
+    load_desktop_today_tomorrow,
     load_desktop_enabled,
+    load_desktop_follow_week,
     load_desktop_opacity,
     load_period_times,
     load_reminders,
     load_theme,
+    load_tray_promoted,
+    load_week_start,
     save_crs_path,
     save_desktop_enabled,
+    save_desktop_follow_week,
     save_desktop_opacity,
+    save_desktop_today_tomorrow,
     save_period_times,
     save_reminders,
     save_theme,
+    save_tray_promoted,
+    save_week_start,
 )
 from . import theme
 
@@ -490,6 +510,9 @@ class SettingsDialog(QDialog):
         theme_value: str = "light",
         desktop_opacity: float = 0.3,
         desktop_enabled: bool = False,
+        desktop_follow_week: bool = False,
+        desktop_today_tomorrow: bool = False,
+        week_start: str = DEFAULT_WEEK_START,
     ):
         super().__init__(parent)
         self.result_period_times: dict[int, tuple[str, str]] | None = None
@@ -497,6 +520,9 @@ class SettingsDialog(QDialog):
         self.result_theme: str = theme.LIGHT
         self.result_opacity: float = desktop_opacity
         self.result_desktop_enabled: bool = bool(desktop_enabled)
+        self.result_desktop_follow_week: bool = bool(desktop_follow_week)
+        self.result_desktop_today_tomorrow: bool = bool(desktop_today_tomorrow)
+        self.result_week_start: str = week_start or DEFAULT_WEEK_START
         self.setWindowTitle("设置")
         self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
 
@@ -529,6 +555,24 @@ class SettingsDialog(QDialog):
             rlay.addLayout(row)
             self.reminder_combos.append(combo)
         self._set_reminder_values(reminders or [])
+        rlay.addSpacing(12)
+        rlay.addWidget(_hint("每周第一天（影响导出内容里标注的「当前周次」）："))
+        week_start_row = QHBoxLayout()
+        self.week_start_combo = QComboBox()
+        for value, label in WEEK_START_CHOICES:
+            self.week_start_combo.addItem(label, value)
+        index = self.week_start_combo.findData(week_start or DEFAULT_WEEK_START)
+        self.week_start_combo.setCurrentIndex(max(0, index))
+        self.week_start_combo.setMinimumWidth(120)
+        week_start_row.addWidget(self.week_start_combo)
+        week_start_row.addStretch(1)
+        rlay.addLayout(week_start_row)
+        rlay.addWidget(
+            _hint(
+                "例如选「周六」时，日历事件里的「当前周次」按周六起算，"
+                "可能与课程本身的周次（如 3-16周）不同。"
+            )
+        )
         rlay.addStretch(1)
         tabs.addTab(reminder_tab, " 导出提醒 ")
 
@@ -544,7 +588,7 @@ class SettingsDialog(QDialog):
         tlay.addWidget(self.theme_combo)
 
         tlay.addSpacing(10)
-        tlay.addWidget(_hint("桌面课表的不透明度（「锁定到桌面」后生效）："))
+        tlay.addWidget(_hint("桌面课表的不透明度（「固定到桌面」后生效）："))
         opacity_row = QHBoxLayout()
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(10, 100)
@@ -575,7 +619,7 @@ class SettingsDialog(QDialog):
         switch_row = QHBoxLayout()
         self.desktop_switch = ToggleSwitch()
         self.desktop_switch.setChecked(bool(desktop_enabled))
-        desktop_label = QLabel("启用「锁定到桌面」")
+        desktop_label = QLabel("启用「固定到桌面」")
         desktop_label.setBuddy(self.desktop_switch)
         switch_row.addWidget(self.desktop_switch)
         switch_row.addSpacing(10)
@@ -583,8 +627,43 @@ class SettingsDialog(QDialog):
         switch_row.addStretch(1)
         elay.addLayout(switch_row)
 
-        elay.addWidget(_hint("开启并保存后，已保存的课表（.crs）才会出现「锁定到桌面」按钮，用来把课表半透明贴在桌面上。"))
-        elay.addWidget(_hint("注意：桌面课表不抢焦点、点击穿透、位于普通窗口之下；若壁纸由动态壁纸软件绘制，图标会被整体压暗一点。"))
+        elay.addWidget(_hint("开启并保存后，已保存的课表（.crs）才会出现「固定到桌面」按钮，用来把课表做成一个桌面小窗。"))
+        elay.addWidget(_hint("注意：小窗无边框、显示在所有窗口之下，按住可以拖动，拖右下角可以缩放；位置和大小会记住，右键菜单可解除。"))
+
+        elay.addSpacing(8)
+        follow_row = QHBoxLayout()
+        self.follow_switch = ToggleSwitch()
+        self.follow_switch.setChecked(bool(desktop_follow_week))
+        follow_label = QLabel("桌面课表跟随「预览周次」")
+        follow_label.setBuddy(self.follow_switch)
+        follow_row.addWidget(self.follow_switch)
+        follow_row.addSpacing(10)
+        follow_row.addWidget(follow_label)
+        follow_row.addStretch(1)
+        elay.addLayout(follow_row)
+        elay.addWidget(_hint("打开后，桌面课表只显示左侧「预览周次」选中的那一周；关闭时显示整学期。"))
+
+        elay.addSpacing(8)
+        today_row = QHBoxLayout()
+        self.today_switch = ToggleSwitch()
+        self.today_switch.setChecked(bool(desktop_today_tomorrow))
+        today_label = QLabel("只显示今天和明天的课")
+        today_label.setBuddy(self.today_switch)
+        today_row.addWidget(self.today_switch)
+        today_row.addSpacing(10)
+        today_row.addWidget(today_label)
+        today_row.addStretch(1)
+        elay.addLayout(today_row)
+        elay.addWidget(
+            _hint(
+                "按系统日期和上方「本学期第一天」推算周次，桌面课表只显示今天和明天的课。"
+                "与「跟随预览周次」二选一，打开一个会自动关掉另一个。"
+            )
+        )
+        # 两个开关互斥
+        self.follow_switch.toggled.connect(self._on_follow_toggled)
+        self.today_switch.toggled.connect(self._on_today_toggled)
+
         elay.addStretch(1)
         tabs.addTab(exp_tab, " 实验性功能 ")
 
@@ -647,6 +726,19 @@ class SettingsDialog(QDialog):
             values.append(minutes)
         return values
 
+    def _on_follow_toggled(self, checked: bool) -> None:
+        """两个桌面显示模式互斥：打开「跟随预览周次」就关掉「今天和明天」。"""
+        if checked and self.today_switch.isChecked():
+            self.today_switch.blockSignals(True)
+            self.today_switch.setChecked(False)
+            self.today_switch.blockSignals(False)
+
+    def _on_today_toggled(self, checked: bool) -> None:
+        if checked and self.follow_switch.isChecked():
+            self.follow_switch.blockSignals(True)
+            self.follow_switch.setChecked(False)
+            self.follow_switch.blockSignals(False)
+
     def _save(self) -> None:
         period_times = self.schedule_editor.period_times()
         if period_times is None:
@@ -659,6 +751,9 @@ class SettingsDialog(QDialog):
         self.result_theme = self.theme_combo.currentData()
         self.result_opacity = self.opacity_slider.value() / 100.0
         self.result_desktop_enabled = self.desktop_switch.isChecked()
+        self.result_desktop_follow_week = self.follow_switch.isChecked()
+        self.result_desktop_today_tomorrow = self.today_switch.isChecked()
+        self.result_week_start = self.week_start_combo.currentData() or DEFAULT_WEEK_START
         self.accept()
 
 
@@ -803,14 +898,22 @@ class SheetSelectDialog(QDialog):
 class WeekGrid(QWidget):
     """自绘周课表网格。"""
 
-    def __init__(self, timetable: Timetable, parent=None):
+    def __init__(self, timetable: Timetable, week: int | None = None, parent=None):
         super().__init__(parent)
         self.timetable = timetable
+        self.week = week  # None = 显示所有周次
         self._viewport_width = 0
         self._compute()
 
     def set_timetable(self, timetable: Timetable) -> None:
         self.timetable = timetable
+        self.week = None  # 换了一份课表就回到「全部周次」
+        self.refresh()
+
+    def set_week(self, week: int | None) -> None:
+        if week == self.week:
+            return
+        self.week = week
         self.refresh()
 
     def set_viewport_width(self, width: int) -> None:
@@ -822,8 +925,18 @@ class WeekGrid(QWidget):
         self._compute()
         self.update()
 
+    def _visible_items(self) -> list[tuple[int, Course]]:
+        """返回 (在完整课表中的下标, 课程)，按周次筛选；未填周次视为整学期。"""
+        items: list[tuple[int, Course]] = []
+        for index, course in enumerate(self.timetable.courses):
+            if self.week is not None and course.weeks and self.week not in course.weeks:
+                continue
+            items.append((index, course))
+        return items
+
     def _compute(self) -> None:
-        courses = self.timetable.courses
+        items = self._visible_items()
+        courses = [course for _, course in items]
         max_period = min(max([12] + [c.period_end for c in courses]), 20)
         head_w, head_h = 92, 36
         avail = self._viewport_width
@@ -835,7 +948,7 @@ class WeekGrid(QWidget):
 
         # 同一格可能有多门课，按 (星期, 起始节, 结束节) 分组后纵向排开
         groups: dict[tuple[int, int, int], list[tuple[int, Course]]] = {}
-        for index, course in enumerate(courses):
+        for index, course in items:
             if not (1 <= course.day <= 7 and 1 <= course.period_start <= 20):
                 continue
             if course.period_end < course.period_start:
@@ -1056,11 +1169,13 @@ class TimetableApp(QMainWindow):
         self._log("3. 双击结果表格中的课程可以修正识别错误；")
         self._log("4. 导出 Excel / JSON / 日历(ICS)。")
         if load_desktop_enabled():
-            self._log("5. 「保存课表」存成 .crs 后，可点「锁定到桌面」把课表半透明贴在桌面上。")
+            self._log("5. 「保存课表」存成 .crs 后，可点「固定到桌面」把课表做成桌面小窗。")
         else:
             self._log("5. 「保存课表」存成 .crs 后会自动记住；需要桌面课表时，先到 设置 → 实验性功能 打开开关。")
-        self._log("提示：日历导出以工具栏里的「第 1 周周一」为基准。")
+        self._log("提示：日历导出以工具栏里的「本学期第一天」为基准，每周从哪天算看设置里的「每周第一天」。")
         self._log(f"崩溃日志：{get_log_path()}")
+        # 托盘图标从一开始就建好，固定桌面后主窗口收起时它就派上用场
+        self._ensure_tray()
         self._restore_saved_timetable()
 
     # ------------------------------------------------------------ 构建界面
@@ -1078,11 +1193,16 @@ class TimetableApp(QMainWindow):
         title.setObjectName("appTitle")
         title_row.addWidget(title)
         title_row.addStretch(1)
-        title_row.addWidget(QLabel("第 1 周周一："))
-        self.week1_edit = QLineEdit(_default_monday().isoformat())
-        self.week1_edit.setMaximumWidth(110)
+        title_row.addWidget(QLabel("本学期第一天："))
+        monday = _default_monday()
+        self.week1_edit = QDateEdit(QDate(monday.year, monday.month, monday.day))
+        self.week1_edit.setCalendarPopup(True)
+        self.week1_edit.setDisplayFormat("yyyy-MM-dd")
+        self.week1_edit.setMaximumWidth(130)
+        self.week1_edit.setToolTip("本学期开始上课的那一天，点右侧箭头打开日历选择；每周从哪天算由「设置 → 导出提醒 → 每周第一天」决定")
+        self.week1_edit.setFocusPolicy(Qt.ClickFocus)
+        self.week1_edit.setSelectedSection(QDateEdit.NoSection)
         title_row.addWidget(self.week1_edit)
-        title_row.addWidget(_hint("YYYY-MM-DD"))
         outer.addLayout(title_row)
 
         button_row = QHBoxLayout()
@@ -1102,7 +1222,7 @@ class TimetableApp(QMainWindow):
         self.open_crs_button = QPushButton("打开课表")
         self.open_crs_button.setToolTip("从 .crs 文件打开之前保存的课表")
         self.open_crs_button.clicked.connect(self.open_crs_file)
-        self.lock_button = QPushButton("锁定到桌面")
+        self.lock_button = QPushButton("固定到桌面")
         self.lock_button.setToolTip("把课表以 30% 不透明度固定在桌面最底层，并驻留托盘")
         self.lock_button.clicked.connect(self.toggle_lock)
         self.lock_button.hide()
@@ -1156,6 +1276,19 @@ class TimetableApp(QMainWindow):
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
+
+        week_row = QHBoxLayout()
+        week_row.setSpacing(6)
+        week_row.addWidget(QLabel("预览周次："))
+        self.week_combo = QComboBox()
+        self.week_combo.setMinimumWidth(120)
+        self.week_combo.setToolTip("选择某一周后，右侧「周课表预览」只显示该周的课程")
+        self.week_combo.currentIndexChanged.connect(self._on_week_changed)
+        week_row.addWidget(self.week_combo)
+        week_row.addSpacing(4)
+        week_row.addWidget(_hint("选「全部周次」显示整学期"))
+        week_row.addStretch(1)
+        lay.addLayout(week_row)
 
         files_box = QGroupBox("文件列表")
         files_lay = QVBoxLayout(files_box)
@@ -1277,6 +1410,45 @@ class TimetableApp(QMainWindow):
         for path in self.files:
             self.file_list.addItem(os.path.basename(path))
 
+    # ------------------------------------------------------------ 日期与预览周次
+
+    def _first_day_text(self) -> str:
+        return self.week1_edit.date().toString("yyyy-MM-dd")
+
+    def _set_first_day(self, text: str) -> None:
+        parsed = QDate.fromString((text or "").strip(), "yyyy-MM-dd")
+        if parsed.isValid():
+            self.week1_edit.setDate(parsed)
+
+    def _week_choices(self) -> list[int]:
+        """可选周次：至少到第 16 周，课表里有更晚的周次再往后延。"""
+        max_week = max(DEFAULT_TERM_WEEKS)
+        for course in self.timetable.courses:
+            weeks = course.weeks or DEFAULT_TERM_WEEKS
+            max_week = max(max_week, max(weeks))
+        return list(range(1, min(max_week, 30) + 1))
+
+    def _refresh_week_options(self) -> None:
+        """重建周次下拉，保持当前预览的周次（以网格状态为准）。"""
+        week = self.grid.week
+        self.week_combo.blockSignals(True)
+        self.week_combo.clear()
+        self.week_combo.addItem("全部周次", None)
+        for choice in self._week_choices():
+            self.week_combo.addItem(f"第 {choice} 周", choice)
+        index = self.week_combo.findData(week) if week is not None else 0
+        self.week_combo.setCurrentIndex(max(0, index))
+        self.week_combo.blockSignals(False)
+
+    def _on_week_changed(self, _index: int) -> None:
+        week = self.week_combo.currentData()
+        self.grid.set_week(week)
+        self._sync_desktop()
+        if week is None:
+            self.statusBar().showMessage("预览：全部周次")
+        else:
+            self.statusBar().showMessage(f"预览：第 {week} 周")
+
     # ------------------------------------------------------------ 设置
 
     def open_settings(self) -> None:
@@ -1288,6 +1460,9 @@ class TimetableApp(QMainWindow):
             load_theme(),
             load_desktop_opacity(),
             load_desktop_enabled(),
+            load_desktop_follow_week(),
+            load_desktop_today_tomorrow(),
+            load_week_start(),
         )
         if dialog.exec_() != QDialog.Accepted:
             return
@@ -1302,17 +1477,21 @@ class TimetableApp(QMainWindow):
         if self.desktop_window is not None:
             self.desktop_window.set_opacity(dialog.result_opacity)
         save_desktop_enabled(dialog.result_desktop_enabled)
+        save_desktop_follow_week(dialog.result_desktop_follow_week)
+        save_desktop_today_tomorrow(dialog.result_desktop_today_tomorrow)
+        save_week_start(dialog.result_week_start)
+        self._sync_desktop()
         if not dialog.result_desktop_enabled and self._locked:
             self._unlock_from_desktop()
-            self._log("「锁定到桌面」已关闭，桌面课表已解除。")
+            self._log("「固定到桌面」已关闭，桌面课表已解除。")
         self._update_lock_button()
         self._log("设置已保存")
         self.statusBar().showMessage("设置已保存")
 
-    # ------------------------------------------------------------ 课表存档 / 桌面锁定
+    # ------------------------------------------------------------ 课表存档 / 固定到桌面
 
     def _set_crs_path(self, path: str | None) -> None:
-        """记录当前课表的 .crs 文件，并据此显示或隐藏「锁定到桌面」。"""
+        """记录当前课表的 .crs 文件，并据此显示或隐藏「固定到桌面」。"""
         self.crs_path = path or None
         save_crs_path(self.crs_path or "")
         self._update_lock_button()
@@ -1325,12 +1504,12 @@ class TimetableApp(QMainWindow):
         )
         if available:
             self.lock_button.show()
-            self.lock_button.setText("解除锁定" if self._locked else "锁定到桌面")
+            self.lock_button.setText("解除固定" if self._locked else "固定到桌面")
         else:
             self.lock_button.hide()
 
     def _restore_saved_timetable(self) -> None:
-        """启动时检测上次保存的 .crs；存在则自动载入并显示锁定按钮。"""
+        """启动时检测上次保存的 .crs；存在则自动载入并显示固定按钮。"""
         path = load_crs_path()
         if (not path or not os.path.isfile(path)) and os.path.isfile(default_crs_path()):
             # 设置丢失时，回退到应用目录下的默认存档
@@ -1338,7 +1517,7 @@ class TimetableApp(QMainWindow):
         if not path or not os.path.isfile(path):
             return
         try:
-            timetable, first_monday = load_crs(path)
+            timetable, first_day = load_crs(path)
         except Exception as exc:
             self._log(f"读取已保存的课表失败：{exc}")
             return
@@ -1346,8 +1525,8 @@ class TimetableApp(QMainWindow):
             return
         self.timetable = timetable
         self.grid.set_timetable(timetable)
-        if first_monday:
-            self.week1_edit.setText(first_monday)
+        if first_day:
+            self._set_first_day(first_day)
         self._set_crs_path(path)
         self._refresh_courses()
         self._log(f"已载入已保存的课表：{path}")
@@ -1364,7 +1543,7 @@ class TimetableApp(QMainWindow):
         if not path.lower().endswith(CRS_SUFFIX):
             path += CRS_SUFFIX
         try:
-            save_crs(self.timetable, self.week1_edit.text().strip(), path)
+            save_crs(self.timetable, self._first_day_text(), path)
         except Exception as exc:
             QMessageBox.critical(self, "保存失败", str(exc))
             return
@@ -1379,7 +1558,7 @@ class TimetableApp(QMainWindow):
         if not path:
             return
         try:
-            timetable, first_monday = load_crs(path)
+            timetable, first_day = load_crs(path)
         except Exception as exc:
             QMessageBox.critical(self, "打开失败", str(exc))
             return
@@ -1388,18 +1567,48 @@ class TimetableApp(QMainWindow):
             return
         self.timetable = timetable
         self.grid.set_timetable(timetable)
-        if first_monday:
-            self.week1_edit.setText(first_monday)
+        if first_day:
+            self._set_first_day(first_day)
         self._set_crs_path(path)
         self._refresh_courses()
         self._sync_desktop()
         self._log(f"已打开课表：{path}（{len(timetable.courses)} 条课程）")
         self.statusBar().showMessage(f"已打开：{os.path.basename(path)}")
 
+    def _desktop_week(self) -> int | None:
+        """桌面课表要显示的周次：开关打开时跟随「预览周次」，否则整学期。"""
+        if load_desktop_today_tomorrow():
+            return None
+        if not load_desktop_follow_week():
+            return None
+        return self.week_combo.currentData()
+
+    def _week_of_date(self, day: QDate) -> int:
+        """按「本学期第一天」+「每周第一天」推算某天属于第几周（小于 1 表示还没开学）。"""
+        first_day = self.week1_edit.date().toPyDate()
+        return term_week_of(day.toPyDate(), first_day, load_week_start())
+
+    def _desktop_slots(self) -> tuple[tuple[int, int], ...] | None:
+        """「只看今天和明天」时返回要显示的 (周次, 星期) 组合，否则 None。"""
+        if not load_desktop_today_tomorrow():
+            return None
+        today = QDate.currentDate()
+        slots = []
+        for offset in (0, 1):
+            day = today.addDays(offset)
+            week = self._week_of_date(day)
+            if week < 1:
+                continue
+            slots.append((week, day.dayOfWeek()))
+        return tuple(slots)
+
     def _sync_desktop(self) -> None:
-        """课表内容变化后，若已锁定桌面就同步刷新。"""
-        if self.desktop_window is not None:
-            self.desktop_window.set_timetable(self.timetable)
+        """课表内容、预览周次或日期设置变化后，若已固定到桌面就同步刷新。"""
+        if self.desktop_window is None:
+            return
+        self.desktop_window.set_timetable(self.timetable)
+        self.desktop_window.set_week(self._desktop_week())
+        self.desktop_window.set_slots(self._desktop_slots())
 
     def toggle_lock(self) -> None:
         if self._locked:
@@ -1412,21 +1621,26 @@ class TimetableApp(QMainWindow):
             QMessageBox.information(
                 self,
                 "提示",
-                "「锁定到桌面」是实验性功能，请先在 设置 → 实验性功能 中打开开关。",
+                "「固定到桌面」是实验性功能，请先在 设置 → 实验性功能 中打开开关。",
             )
             return
         if not self.crs_path or not os.path.isfile(self.crs_path):
             QMessageBox.information(self, "提示", "请先点「保存课表」。")
             return
-        # 锁定前先写回 .crs，保证桌面显示的是最新内容
+        # 固定到桌面前先写回 .crs，保证桌面显示的是最新内容
         try:
-            save_crs(self.timetable, self.week1_edit.text().strip(), self.crs_path)
+            save_crs(self.timetable, self._first_day_text(), self.crs_path)
         except Exception as exc:
-            self._log(f"锁定前保存失败：{exc}")
+            self._log(f"固定前保存失败：{exc}")
         if self.desktop_window is None:
             self.desktop_window = DesktopPinWindow(self.timetable)
+            self.desktop_window.unlockRequested.connect(self._unlock_from_desktop)
+            self.desktop_window.fixTrayRequested.connect(self._fix_tray_from_card)
+            self.desktop_window.showMainRequested.connect(self._show_from_tray)
         else:
             self.desktop_window.set_timetable(self.timetable)
+        self.desktop_window.set_week(self._desktop_week())
+        self.desktop_window.set_slots(self._desktop_slots())
         opacity = load_desktop_opacity()
         self.desktop_window.set_opacity(opacity)
         self.desktop_window.show_on_screen()
@@ -1434,14 +1648,28 @@ class TimetableApp(QMainWindow):
         self._ensure_tray()
         self._update_lock_button()
         percent = int(round(opacity * 100))
-        self._log(f"课表已锁定到桌面（{percent}% 不透明度，位于桌面图标之下）。")
+        week = self._desktop_week()
+        slots = self._desktop_slots()
+        if slots:
+            scope = "今天和明天"
+        elif week is not None:
+            scope = f"仅第 {week} 周"
+        else:
+            scope = "整学期"
+        self._log(
+            f"课表已固定到桌面（{percent}% 不透明度，{scope}，置底小窗，可拖动/缩放）。"
+        )
         self.statusBar().showMessage("课表已固定到桌面")
+        # 固定后把主窗口收进托盘，桌面上只留课表
+        QApplication.instance().setQuitOnLastWindowClosed(False)
+        self.hide()
         if self.tray is not None:
             self.tray.showMessage(
                 "课表已固定到桌面",
-                f"课表已半透明贴在桌面图标下面（{percent}% 不透明度），程序驻留在系统托盘。",
+                "主窗口已收起，只保留桌面课表。拖动可移动、右键可解除；"
+                "托盘图标若在任务栏的「^」里，可以把它拖到任务栏固定。",
                 QSystemTrayIcon.Information,
-                2500,
+                3500,
             )
 
     def _unlock_from_desktop(self) -> None:
@@ -1451,10 +1679,14 @@ class TimetableApp(QMainWindow):
             self.desktop_window = None
         self._locked = False
         self._update_lock_button()
-        self._log("已解除桌面锁定。")
-        self.statusBar().showMessage("已解除桌面锁定")
-        if self.tray is not None and self.isVisible():
-            self.tray.hide()
+        self._log("已解除桌面固定。")
+        self.statusBar().showMessage("已解除桌面固定")
+        QApplication.instance().setQuitOnLastWindowClosed(True)
+        # 解除后把主窗口叫回来，否则用户会以为程序没了
+        if not self.isVisible():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
     def _ensure_tray(self) -> None:
         if self.tray is not None:
@@ -1465,7 +1697,7 @@ class TimetableApp(QMainWindow):
         menu = QMenu(self)
         show_action = menu.addAction("显示主窗口")
         show_action.triggered.connect(self._show_from_tray)
-        unlock_action = menu.addAction("解除桌面锁定")
+        unlock_action = menu.addAction("解除固定")
         unlock_action.triggered.connect(self._unlock_from_desktop)
         menu.addSeparator()
         quit_action = menu.addAction("退出")
@@ -1474,6 +1706,79 @@ class TimetableApp(QMainWindow):
         tray.activated.connect(self._on_tray_activated)
         self.tray = tray
         tray.show()
+        # Windows 11 默认把新图标塞进任务栏的「^」溢出区，启动后把它提到任务栏上
+        QTimer.singleShot(600, self._promote_tray_icon)
+
+    def _promote_tray_icon(self, attempts: int = 10) -> None:
+        """把托盘图标放到任务栏上。
+
+        Windows 会为每个 exe 在通知区域设置里记一条，条目要等图标第一次出现后才建立，
+        所以这里轮询几次；确认显示在任务栏后就重新注册一次图标，让它立刻生效。
+        """
+        if self.tray is None:
+            return
+        exe = sys.executable or ""
+        if load_tray_promoted() == exe and tray_promoted_state() == 0:
+            # 上次就是自己把它收进「^」的，别和用户对着干
+            return
+        state = promote_tray_icon()
+        if state in ("promoted", "already"):
+            if state == "promoted" or load_tray_promoted() != exe:
+                save_tray_promoted(exe)
+                self._refresh_tray_icon()
+            self._log_tray_state()
+            return
+        if attempts > 1:
+            QTimer.singleShot(800, lambda: self._promote_tray_icon(attempts - 1))
+        else:
+            self._log_tray_state()
+
+    def _refresh_tray_icon(self) -> None:
+        """隐藏再显示一次托盘图标，让新的可见性设置立即生效。"""
+        if self.tray is None:
+            return
+        self.tray.hide()
+        QTimer.singleShot(200, self.tray.show)
+
+    def _tray_is_elevated(self) -> bool:
+        """是否以管理员权限运行（Windows 不会在任务栏显示管理员程序的托盘图标）。"""
+        try:
+            import ctypes
+
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+
+    def _log_tray_state(self) -> None:
+        """把托盘图标的注册表状态写进日志，方便排查「看不见图标」。"""
+        key = tray_registry_key()
+        state = tray_promoted_state()
+        if key is None:
+            self._log("托盘：系统里还没有本程序的托盘条目（图标可能刚开始加载）。")
+        elif state == 1:
+            self._log("托盘：已设置为「显示在任务栏」。")
+        else:
+            self._log("托盘：被收在任务栏的「^」溢出区，点开「^」把图标拖到任务栏即可固定。")
+        if self._tray_is_elevated():
+            self._log(
+                "托盘：程序以管理员权限运行，Windows 默认不在任务栏显示管理员程序的托盘图标，"
+                "请改用普通权限启动。"
+            )
+
+    def _fix_tray_from_card(self) -> None:
+        """桌面课表右键菜单里的「把图标放回任务栏」。"""
+        self._ensure_tray()
+        save_tray_promoted("")  # 清掉「用户自己收起来」的记录，强制再试一次
+        state = promote_tray_icon()
+        self._refresh_tray_icon()
+        if state in ("promoted", "already"):
+            save_tray_promoted(sys.executable or "")
+            self._log("已把托盘图标放回任务栏。")
+            self.statusBar().showMessage("托盘图标已放回任务栏")
+        else:
+            self._log("没找到托盘注册表条目；图标可能在任务栏的「^」里，点开后拖到任务栏即可。")
+            self.statusBar().showMessage("请点任务栏的「^」，把本程序图标拖到任务栏")
+        self._log_tray_state()
 
     def _on_tray_activated(self, reason) -> None:
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
@@ -1707,6 +2012,7 @@ class TimetableApp(QMainWindow):
                     item.setBackground(QColor(theme.conflict_color()))
                 table.setItem(row, col, item)
         table.setUpdatesEnabled(True)
+        self._refresh_week_options()
         self.grid.refresh()
         self._sync_desktop()
 
@@ -1844,35 +2150,29 @@ class TimetableApp(QMainWindow):
     def export_ics_file(self) -> None:
         if not self._ensure_courses():
             return
-        try:
-            first_monday = date.fromisoformat(self.week1_edit.text().strip())
-        except ValueError:
-            QMessageBox.warning(
-                self,
-                "日期格式错误",
-                "「第 1 周周一」请填写 YYYY-MM-DD，例如 2026-09-07",
-            )
-            return
+        first_day = self.week1_edit.date().toPyDate()
         reminders = load_reminders()
         path = self._ask_save("课程表.ics", "iCalendar 日历 (*.ics)", ".ics")
         if not path:
             return
         try:
-            aligned, count = export_ics(
+            anchor, count, skipped = export_ics(
                 self.timetable.courses,
                 path,
-                first_monday,
+                first_day,
                 self.timetable.period_times,
                 reminders,
+                load_week_start(),
             )
         except Exception as exc:
             QMessageBox.critical(self, "导出失败", str(exc))
             return
-        if aligned != first_monday:
+        if anchor != first_day:
             self._log(
-                f"日期已对齐到该周周一：{aligned.isoformat()}"
-                f"（原输入 {first_monday.isoformat()}）"
+                f"第 1 周从 {anchor.isoformat()} 开始（按「每周第一天」，本学期第一天 {first_day.isoformat()}）"
             )
+        if skipped:
+            self._log(f"{skipped} 个日期早于「本学期第一天」，已跳过")
         missing_weeks = sum(1 for c in self.timetable.courses if not c.weeks)
         if missing_weeks:
             self._log(f"{missing_weeks} 条课程未识别到周次，已按 1-16 周写入日历")

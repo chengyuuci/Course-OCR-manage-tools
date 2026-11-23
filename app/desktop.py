@@ -1,14 +1,24 @@
-"""把课表固定到桌面（半透明、贴在壁纸层、不挡鼠标）以及托盘图标。
+"""把课表固定到桌面上：一个无边框、置底、可拖动的小窗，以及托盘图标。
 
-桌面课表会尽量挂到资源管理器的桌面 WorkerW 下面：这样它显示在壁纸之上、
-**桌面图标与所有窗口之下**，像一层贴在桌面上的课表。挂接失败时退回到
-「普通窗口 + 置底」的方式。
+小窗用自绘的课表卡片，拖动窗口可移动、拖右下角可缩放，位置和大小会记在
+settings.ini 里，下次固定回到原处。用托盘图标或右键菜单可以解除。
 """
 from __future__ import annotations
 
+import ctypes
+import os
+import sys
 import zlib
 
-from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer
+from PyQt5.QtCore import (
+    QPoint,
+    QPointF,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt5.QtGui import (
     QColor,
     QFont,
@@ -16,22 +26,27 @@ from PyQt5.QtGui import (
     QIcon,
     QImage,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
 )
-from PyQt5.QtWidgets import QApplication, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QApplication, QMenu, QVBoxLayout, QWidget
 
 from .models import DAY_NAMES
+from .settings import load_desktop_geometry, save_desktop_geometry
 
-# 桌面课表的默认不透明度（0.3 = 30%），可在「设置 → 外观」里用滑块调整
-DESKTOP_OPACITY = 0.3
+# 桌面小窗的默认不透明度（0.85），可在「设置 → 外观」里用滑块调整
+DESKTOP_OPACITY = 0.85
 MIN_DESKTOP_OPACITY = 0.10
 MAX_DESKTOP_OPACITY = 1.00
 
+# 默认小窗尺寸（逻辑像素）与允许的最小尺寸
+DEFAULT_PIN_SIZE = QSize(560, 700)
+MIN_PIN_SIZE = QSize(320, 240)
+
 _UI_FONT = "Microsoft YaHei UI"
 
-# 桌面课表固定使用深色底 + 浅色字：整层只有 30% 不透明度，
-# 深色底压暗桌面、浅色字提亮，这样在浅色和深色壁纸上都还能看清。
+# 桌面课表固定使用深色底 + 浅色字：深色卡片在浅色与深色壁纸/窗口上都好认。
 _BG = "#263238"
 _HEADER = "#37474F"
 _LINE = "#455A64"
@@ -59,6 +74,8 @@ class DesktopGrid(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.timetable = None
+        self.week: int | None = None  # None = 整学期
+        self.slots: tuple[tuple[int, int], ...] | None = None  # ((周次, 星期), ...)
         self.opacity = DESKTOP_OPACITY
         self._cache: QImage | None = None
         self._cache_key = None
@@ -66,6 +83,45 @@ class DesktopGrid(QWidget):
     def set_timetable(self, timetable) -> None:
         self.timetable = timetable
         self._invalidate()
+
+    def set_week(self, week: int | None) -> None:
+        if week == self.week:
+            return
+        self.week = week
+        self._invalidate()
+
+    def set_slots(self, slots) -> None:
+        """只保留指定的 (周次, 星期) 组合，用于「只看今天和明天」。"""
+        normalized = None
+        if slots:
+            normalized = tuple(sorted({(int(w), int(d)) for w, d in slots}))
+        if normalized == self.slots:
+            return
+        self.slots = normalized
+        self._invalidate()
+
+    def _visible_courses(self) -> list:
+        """按当前周次/日期筛选课程；未填周次的课程视为整学期每周都有。"""
+        timetable = self.timetable
+        if timetable is None:
+            return []
+        if self.slots:
+            picked = []
+            for course in timetable.courses:
+                if not 1 <= course.day <= 7:
+                    continue
+                for week, day in self.slots:
+                    if course.day == day and (not course.weeks or week in course.weeks):
+                        picked.append(course)
+                        break
+            return picked
+        if self.week is None:
+            return list(timetable.courses)
+        return [
+            course
+            for course in timetable.courses
+            if not course.weeks or self.week in course.weeks
+        ]
 
     def set_opacity(self, value) -> None:
         self.opacity = clamp_opacity(value)
@@ -88,7 +144,7 @@ class DesktopGrid(QWidget):
 
     def _content_image(self) -> QImage:
         ratio = self.devicePixelRatioF() or 1.0
-        key = (self.width(), self.height(), ratio, id(self.timetable))
+        key = (self.width(), self.height(), ratio, id(self.timetable), self.week, self.slots)
         if self._cache is not None and self._cache_key == key:
             return self._cache
         width = max(1, int(round(self.width() * ratio)))
@@ -105,14 +161,34 @@ class DesktopGrid(QWidget):
         return image
 
     def _paint_content(self, painter: QPainter, rect: QRectF) -> None:
+        # 小窗是圆角卡片：内容全部裁到圆角路径里，四角透出后面的桌面/窗口
+        card_radius = max(8.0, min(20.0, rect.height() * 0.015))
+        card = QPainterPath()
+        card.addRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), card_radius, card_radius)
+
+        painter.save()
+        painter.setClipPath(card)
         painter.fillRect(rect, QColor(_BG))
+
+        def finish() -> None:
+            painter.restore()
+            painter.setPen(QPen(QColor(_LINE), 1))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPath(card)
 
         timetable = self.timetable
         if timetable is None:
+            painter.setPen(QColor(_TEXT))
+            hint_font = QFont(_UI_FONT)
+            hint_font.setPixelSize(max(11, min(18, int(rect.height() * 0.03))))
+            painter.setFont(hint_font)
+            painter.drawText(rect, Qt.AlignCenter, "暂无课表")
+            finish()
             return
 
+        courses = self._visible_courses()
         days = 7
-        max_period = max(timetable.max_period(), 8)
+        max_period = max(8, max((c.period_end for c in courses), default=0))
         width, height = rect.width(), rect.height()
 
         # 间距随屏幕大小缩放；上下限避免小窗口太挤、大屏太空
@@ -214,7 +290,7 @@ class DesktopGrid(QWidget):
             )
 
         # 课程块
-        for course in timetable.courses:
+        for course in courses:
             if not 1 <= course.day <= 7:
                 continue
             first_row = max(1, course.period_start) - 1
@@ -244,135 +320,21 @@ class DesktopGrid(QWidget):
                 label,
             )
 
-
-def _user32():
-    import ctypes
-    from ctypes import wintypes
-
-    lib = ctypes.WinDLL("user32", use_last_error=True)
-    lib.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
-    lib.FindWindowW.restype = wintypes.HWND
-    lib.FindWindowExW.argtypes = [
-        wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR
-    ]
-    lib.FindWindowExW.restype = wintypes.HWND
-    lib.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
-    lib.GetWindow.restype = wintypes.HWND
-    lib.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-    lib.GetClassNameW.restype = ctypes.c_int
-    lib.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
-    lib.EnumWindows.restype = wintypes.BOOL
-    lib.SendMessageTimeoutW.argtypes = [
-        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
-        wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t),
-    ]
-    lib.SendMessageTimeoutW.restype = wintypes.LPARAM
-    return lib
-
-
-def _class_name(user32, hwnd: int) -> str:
-    if not hwnd:
-        return ""
-    import ctypes
-
-    buf = ctypes.create_unicode_buffer(128)
-    user32.GetClassNameW(hwnd, buf, 128)
-    return buf.value
-
-
-def _desktop_layer_target() -> tuple[int, int]:
-    """找到桌面课表应挂接的位置：``(父窗口, 插到这个窗口之后)``。
-
-    插入点在 **桌面图标之下、壁纸之上**，也就是把课表贴在图标层与壁纸层之间。
-    返回 ``(0, 0)`` 表示当前桌面结构不支持这种挂接。
-    """
-    try:
-        user32 = _user32()
-    except Exception:  # pragma: no cover - 非 Windows
-        return 0, 0
-
-    progman = int(user32.FindWindowW("Progman", None) or 0)
-    if not progman:
-        return 0, 0
-
-    # 让资源管理器把壁纸层与图标层拆开（Win10 / Win11 通用做法）
-    try:
-        import ctypes
-
-        result = ctypes.c_size_t(0)
-        for wparam in (0xD, 0):
-            user32.SendMessageTimeoutW(
-                progman, 0x052C, wparam, 0, 0, 1000, ctypes.byref(result)
-            )
-    except Exception:
-        pass
-
-    # 新结构：图标窗口 SHELLDLL_DefView 直接挂在 Progman 下，壁纸宿主 WorkerW 在它后面
-    defview = int(user32.FindWindowExW(progman, None, "SHELLDLL_DefView", None) or 0)
-    if defview:
-        return progman, defview
-
-    # 旧结构：图标窗口在某个顶层窗口里，壁纸 WorkerW 是同一层的下一个窗口
-    hosts: list[int] = []
-    callback_type = None
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-        def enum_cb(hwnd, _lparam):
-            if user32.FindWindowExW(hwnd, None, "SHELLDLL_DefView", None):
-                hosts.append(int(hwnd))
-            return True
-
-        user32.EnumWindows(callback_type(enum_cb), 0)
-    except Exception:
-        return 0, 0
-    for host in hosts:
-        worker = int(user32.FindWindowExW(None, host, "WorkerW", None) or 0)
-        if worker:
-            return worker, 0  # 直接放在壁纸宿主里最上层，图标仍压在它上面
-    return 0, 0
-
-
-# Wallpaper Engine 等动态壁纸会把壁纸画成独立的 D3D 宿主窗口（WPEImageWallpaper /
-# WPEVideoWallpaper）。这类壁纸由合成器绘制在所有 GDI 子窗口之上，无法把课表插到
-# 壁纸与图标之间，只能退化成「最底层普通窗口」。
-_D3D_WALLPAPER_PREFIXES = ("WPE",)
-
-
-def _wallpaper_is_d3d_hosted() -> bool:
-    """壁纸是否由 D3D 宿主窗口绘制（此时无法把课表贴到壁纸上）。"""
-    try:
-        user32 = _user32()
-    except Exception:  # pragma: no cover - 非 Windows
-        return False
-
-    progman = int(user32.FindWindowW("Progman", None) or 0)
-    if not progman:
-        return False
-    defview = int(user32.FindWindowExW(progman, None, "SHELLDLL_DefView", None) or 0)
-    candidates = []
-    if defview:
-        sibling = int(user32.GetWindow(defview, 2) or 0)  # GW_HWNDNEXT -> 壁纸宿主
-        if sibling:
-            candidates.append(sibling)
-    if not candidates:
-        candidates.append(progman)
-    for host in candidates:
-        child = int(user32.GetWindow(host, 5) or 0)  # GW_CHILD
-        while child:
-            name = _class_name(user32, child)
-            if name.startswith(_D3D_WALLPAPER_PREFIXES):
-                return True
-            child = int(user32.GetWindow(child, 2) or 0)
-    return False
-
+        finish()
 
 
 class DesktopPinWindow(QWidget):
-    """贴在桌面上的课表窗口：无边框、半透明、在图标与窗口之下、不挡鼠标。"""
+    """固定在桌面上的课表小窗：无边框、置底、半透明，可拖动可缩放。
+
+    位置与大小会写进 settings.ini，下次固定回到原处；右键菜单与托盘都能解除。
+    """
+
+    unlockRequested = pyqtSignal()
+    fixTrayRequested = pyqtSignal()
+    showMainRequested = pyqtSignal()
+
+    _GRIP = 18  # 右下角缩放热区（逻辑像素）
+    _KEEP_BOTTOM_MS = 1500  # 定时把窗口重新压到底层
 
     def __init__(self, timetable=None, parent=None):
         super().__init__(
@@ -380,18 +342,25 @@ class DesktopPinWindow(QWidget):
             Qt.Tool
             | Qt.FramelessWindowHint
             | Qt.WindowStaysOnBottomHint
-            | Qt.WindowDoesNotAcceptFocus
-            | Qt.WindowTransparentForInput,
+            | Qt.WindowDoesNotAcceptFocus,
         )
-        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         # 关闭这层课表不应触发「最后一个窗口关闭 → 退出程序」
         self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_NoSystemBackground, True)
-        self.setWindowTitle("课表（桌面）")
-        self.attached_to_wallpaper = False
-        self._bottom_timer: QTimer | None = None
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setMouseTracking(True)
+        self.setWindowTitle("课表")
+        self.setMinimumSize(MIN_PIN_SIZE)
+        self._drag_offset: QPoint | None = None
+        self._resize_origin: QPoint | None = None
+        self._resize_size: QSize | None = None
+        self._keep_bottom = QTimer(self)
+        self._keep_bottom.setInterval(self._KEEP_BOTTOM_MS)
+        self._keep_bottom.timeout.connect(self._send_to_bottom)
         self.grid = DesktopGrid(self)
+        # 网格只是画出来的，把鼠标事件让给窗口本身，拖动/缩放才收得到
+        self.grid.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -399,8 +368,18 @@ class DesktopPinWindow(QWidget):
         if timetable is not None:
             self.grid.set_timetable(timetable)
 
+    # ------------------------------------------------------------ 内容
+
     def set_timetable(self, timetable) -> None:
         self.grid.set_timetable(timetable)
+
+    def set_week(self, week: int | None) -> None:
+        """限定只显示某一周；传入 None 显示整学期。"""
+        self.grid.set_week(week)
+
+    def set_slots(self, slots) -> None:
+        """只显示指定 (周次, 星期) 的课，用于「只看今天和明天」。"""
+        self.grid.set_slots(slots)
 
     def set_opacity(self, value) -> None:
         self.grid.set_opacity(value)
@@ -408,144 +387,143 @@ class DesktopPinWindow(QWidget):
     def opacity(self) -> float:
         return self.grid.opacity
 
+    # ------------------------------------------------------------ 显示与摆放
+
     def show_on_screen(self) -> None:
-        """铺满主屏幕，并尽量贴到壁纸与桌面图标之间。"""
-        screen = QApplication.primaryScreen()
-        if screen is not None:
-            self.setGeometry(screen.geometry())
+        """按上次的位置/大小显示小窗；没有记录时放在屏幕右侧居中。"""
+        self._restore_placement()
         self.show()
-        parent, insert_after = _desktop_layer_target()
-        attached = False
-        # 动态壁纸（Wallpaper Engine 等）把壁纸画在合成器图层上，
-        # GDI 子窗口无法显示在它上面，这时直接退化为「最底层普通窗口」。
-        if parent and not _wallpaper_is_d3d_hosted():
-            attached = self._attach_to_wallpaper(parent, insert_after)
-        self.attached_to_wallpaper = attached
-        if not attached:
-            self._fallback_to_bottom()
+        self._send_to_bottom()
+        self._keep_bottom.start()
         self.grid.update()
 
-    def _attach_to_wallpaper(self, parent: int, insert_after: int) -> bool:
-        """把窗口挂到桌面壁纸层，让桌面图标叠在课表上面。"""
+    def _send_to_bottom(self) -> None:
+        """用 Win32 把窗口压到 z 序最底（Qt 的 bottom hint 在部分场景会失效）。"""
+        if not self.isVisible():
+            return
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            if not parent:
-                return False
-            user32 = ctypes.WinDLL("user32", use_last_error=True)
-            user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
-            user32.SetParent.restype = wintypes.HWND
-            user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-            user32.GetWindowLongW.restype = wintypes.LONG
-            user32.SetWindowLongW.argtypes = [
-                wintypes.HWND, ctypes.c_int, wintypes.LONG
-            ]
-            user32.SetWindowLongW.restype = wintypes.LONG
-            user32.SetWindowPos.argtypes = [
-                wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
-                ctypes.c_int, ctypes.c_int, wintypes.UINT,
-            ]
-            user32.SetWindowPos.restype = wintypes.BOOL
-
+            user32 = ctypes.windll.user32
             hwnd = int(self.winId())
-            if not user32.SetParent(hwnd, parent):
-                return False
-
-            # 子窗口样式：去掉 WS_POPUP，加上 WS_CHILD / WS_VISIBLE
-            gwl_style = -16
-            style = user32.GetWindowLongW(hwnd, gwl_style) or 0
-            style = (style | 0x40000000 | 0x10000000) & ~0x80000000
-            user32.SetWindowLongW(hwnd, gwl_style, style)
-
-            ratio = self.devicePixelRatioF() or 1.0
-            width = max(1, int(round(self.width() * ratio)))
-            height = max(1, int(round(self.height() * ratio)))
-            swp_framechanged = 0x0020
-            swp_nozorder = 0x0004
-            swp_noactivate = 0x0010
-            if insert_after:
-                # 插到图标窗口之后：这一层位于图标之下、壁纸之上
-                user32.SetWindowPos(
-                    hwnd, insert_after, 0, 0, width, height,
-                    swp_framechanged | swp_noactivate,
-                )
-            else:
-                # 壁纸宿主内部放到最上层，图标仍在另一个窗口里压着它
-                user32.SetWindowPos(
-                    hwnd, 0, 0, 0, width, height,
-                    swp_framechanged | swp_nozorder | swp_noactivate,
-                )
-            self._stop_bottom_timer()
-            return True
+            user32.SetWindowPos(
+                hwnd, 1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010
+            )  # HWND_BOTTOM, NOSIZE|NOMOVE|NOACTIVATE
         except Exception:
-            return False
+            pass
 
-    def _fallback_to_bottom(self) -> None:
-        """退路：当作最底层的普通窗口，盖不住任何普通窗口。"""
-        self.lower()
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt 回调
+        super().showEvent(event)
         self._send_to_bottom()
-        if self._bottom_timer is None:
-            self._bottom_timer = QTimer(self)
-            self._bottom_timer.setInterval(3000)
-            self._bottom_timer.timeout.connect(self._keep_at_bottom)
-        self._bottom_timer.start()
-
-    def _keep_at_bottom(self) -> None:
-        if self.isVisible() and not self.attached_to_wallpaper:
-            self._send_to_bottom()
-
-    def _stop_bottom_timer(self) -> None:
-        if self._bottom_timer is not None:
-            self._bottom_timer.stop()
+        self._keep_bottom.start()
 
     def hideEvent(self, event) -> None:  # noqa: N802 - Qt 回调
-        self._stop_bottom_timer()
+        self._keep_bottom.stop()
         super().hideEvent(event)
 
-    def _detach_from_wallpaper(self) -> None:
-        """把挂到壁纸层的窗口还原成普通顶层窗口，避免关闭时留下收不掉的残影。"""
-        try:
-            import ctypes
-            from ctypes import wintypes
+    def _restore_placement(self) -> None:
+        saved = load_desktop_geometry()
+        if saved is not None:
+            x, y, width, height = saved
+            screen = _screen_for_point(QPoint(x + width // 2, y + height // 2))
+            if screen is not None:
+                area = screen.availableGeometry()
+                width = max(MIN_PIN_SIZE.width(), min(width, area.width()))
+                height = max(MIN_PIN_SIZE.height(), min(height, area.height()))
+                x = max(area.left(), min(x, area.right() - width + 1))
+                y = max(area.top(), min(y, area.bottom() - height + 1))
+                self.setGeometry(x, y, width, height)
+                return
+        screen = QApplication.primaryScreen()
+        area = screen.availableGeometry() if screen is not None else None
+        width = DEFAULT_PIN_SIZE.width()
+        height = DEFAULT_PIN_SIZE.height()
+        if area is not None:
+            width = min(width, int(area.width() * 0.9))
+            height = min(height, int(area.height() * 0.9))
+            x = area.right() - width - max(16, int(area.width() * 0.02))
+            y = area.top() + max(16, (area.height() - height) // 3)
+        else:  # pragma: no cover - 没有屏幕时只求能显示
+            x = y = 100
+        self.setGeometry(x, y, width, height)
 
-            user32 = ctypes.WinDLL("user32", use_last_error=True)
-            user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
-            user32.SetParent.restype = wintypes.HWND
-            user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-            user32.GetWindowLongW.restype = wintypes.LONG
-            user32.SetWindowLongW.argtypes = [
-                wintypes.HWND, ctypes.c_int, wintypes.LONG
-            ]
-            user32.SetWindowLongW.restype = wintypes.LONG
+    def _save_placement(self) -> None:
+        geometry = self.geometry()
+        save_desktop_geometry(
+            geometry.x(), geometry.y(), geometry.width(), geometry.height()
+        )
 
-            hwnd = int(self.winId())
-            user32.SetParent(hwnd, None)
-            gwl_style = -16
-            style = user32.GetWindowLongW(hwnd, gwl_style) or 0
-            style = (style | 0x80000000) & ~0x40000000  # 恢复 WS_POPUP，去掉 WS_CHILD
-            user32.SetWindowLongW(hwnd, gwl_style, style)
-        except Exception:
-            pass
-        self.attached_to_wallpaper = False
+    # ------------------------------------------------------------ 鼠标交互
+
+    def _in_grip(self, pos: QPoint) -> bool:
+        return (
+            pos.x() >= self.width() - self._GRIP
+            and pos.y() >= self.height() - self._GRIP
+        )
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt 回调
+        if event.button() != Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+        pos = event.pos()
+        if self._in_grip(pos):
+            self._resize_origin = event.globalPos()
+            self._resize_size = self.size()
+        else:
+            self._drag_offset = event.globalPos() - self.frameGeometry().topLeft()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt 回调
+        if self._resize_origin is not None and self._resize_size is not None:
+            delta = event.globalPos() - self._resize_origin
+            width = max(MIN_PIN_SIZE.width(), self._resize_size.width() + delta.x())
+            height = max(MIN_PIN_SIZE.height(), self._resize_size.height() + delta.y())
+            self.resize(width, height)
+            event.accept()
+            return
+        if self._drag_offset is not None:
+            self.move(event.globalPos() - self._drag_offset)
+            event.accept()
+            return
+        # 悬停在右下角时给个缩放光标提示
+        if self._in_grip(event.pos()):
+            self.setCursor(Qt.SizeFDiagCursor)
+        else:
+            self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt 回调
+        changed = self._drag_offset is not None or self._resize_origin is not None
+        self._drag_offset = None
+        self._resize_origin = None
+        self._resize_size = None
+        if changed:
+            self._save_placement()
+        # 拖完/缩放完重新压回底层，别在这次点击里被抬到上面
+        self._send_to_bottom()
+        event.accept()
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt 回调
+        menu = QMenu(self)
+        menu.addAction("显示主窗口", self.showMainRequested.emit)
+        menu.addAction("把图标放回任务栏", self.fixTrayRequested.emit)
+        menu.addAction("解除固定", self.unlockRequested.emit)
+        menu.exec_(event.globalPos())
+        self._send_to_bottom()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 回调
-        self._stop_bottom_timer()
-        if self.attached_to_wallpaper:
-            self._detach_from_wallpaper()
+        self._save_placement()
         super().closeEvent(event)
 
-    def _send_to_bottom(self) -> None:
-        """Qt 的置底提示在部分 Windows 版本上不够稳，再用 Win32 压一次。"""
-        try:
-            import ctypes
 
-            hwnd = int(self.winId())
-            hwnd_bottom = 1
-            flags = 0x0001 | 0x0002 | 0x0010  # SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
-            ctypes.windll.user32.SetWindowPos(hwnd, hwnd_bottom, 0, 0, 0, 0, flags)
-        except Exception:
-            pass
+def _screen_for_point(point: QPoint):
+    """找到包含该点的屏幕；找不到就返回 None。"""
+    screen = QApplication.screenAt(point)
+    if screen is not None:
+        return screen
+    for candidate in QApplication.screens():
+        if candidate.geometry().contains(point):
+            return candidate
+    return None
+
 
 
 def build_tray_icon(size: int = 32) -> QIcon:
@@ -585,3 +563,96 @@ def build_tray_icon(size: int = 32) -> QIcon:
     painter.drawEllipse(QPointF(size * 0.64, size * 0.2), 1.8, 1.8)
     painter.end()
     return QIcon(pixmap)
+
+
+def tray_registry_key() -> str | None:
+    """找到本程序在 Windows 通知区域设置里的条目名（按 exe 路径匹配）。"""
+    try:
+        import winreg
+    except ImportError:
+        return None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, r"Control Panel\NotifyIconSettings"
+        ) as root:
+            count = winreg.QueryInfoKey(root)[0]
+            target = os.path.normcase(os.path.abspath(sys.executable))
+            for index in range(count):
+                try:
+                    name = winreg.EnumKey(root, index)
+                except OSError:
+                    continue
+                try:
+                    with winreg.OpenKey(root, name) as item:
+                        value, _ = winreg.QueryValueEx(item, "ExecutablePath")
+                except OSError:
+                    continue
+                if os.path.normcase(os.path.abspath(value)) == target:
+                    return name
+    except OSError:
+        return None
+    return None
+
+
+def tray_promoted_state() -> int:
+    """读取本程序托盘条目的 IsPromoted：1 显示在任务栏、0 收在「^」里、-1 没有条目。"""
+    try:
+        import winreg
+    except ImportError:
+        return -1
+    name = tray_registry_key()
+    if name is None:
+        return -1
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Control Panel\NotifyIconSettings\%s" % name,
+        ) as item:
+            try:
+                promoted, _ = winreg.QueryValueEx(item, "IsPromoted")
+            except OSError:
+                return 0
+            return 1 if int(promoted) == 1 else 0
+    except OSError:
+        return -1
+
+
+def promote_tray_icon() -> str:
+    """把托盘图标从任务栏的「^」溢出区提到任务栏上（Windows 11 默认会藏进去）。
+
+    返回状态字符串：
+      "promoted" 刚设置成功
+      "already"  本来就是显示在任务栏上的
+      "missing"  系统里还没有本程序的托盘条目（图标可能刚出现，需要稍后重试）
+      "error"    读写注册表失败
+    只写当前用户自己的通知区域设置，不需要管理员权限。
+    """
+    try:
+        import winreg
+    except ImportError:
+        return "error"
+    name = tray_registry_key()
+    if name is None:
+        return "missing"
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Control Panel\NotifyIconSettings\%s" % name,
+            0,
+            winreg.KEY_READ | winreg.KEY_SET_VALUE,
+        ) as item:
+            try:
+                promoted, _ = winreg.QueryValueEx(item, "IsPromoted")
+            except OSError:
+                promoted = 0
+            if int(promoted) == 1:
+                return "already"
+            winreg.SetValueEx(item, "IsPromoted", 0, winreg.REG_DWORD, 1)
+            # 回读确认，避免写了个寂寞
+            try:
+                check, _ = winreg.QueryValueEx(item, "IsPromoted")
+            except OSError:
+                return "error"
+            return "promoted" if int(check) == 1 else "error"
+    except OSError:
+        return "error"

@@ -55,7 +55,7 @@ QPushButton:hover { background-color: #4A4A4A; }
 QPushButton:pressed { background-color: #333333; }
 QPushButton:disabled { color: #777777; background-color: #2E2E2E; }
 
-QLineEdit, QComboBox, QSpinBox, QTimeEdit {
+QLineEdit, QComboBox, QSpinBox, QTimeEdit, QDateEdit {
     background-color: #2B2B2B;
     border: 1px solid #4A4A4A;
     border-radius: 3px;
@@ -114,6 +114,43 @@ QComboBox QAbstractItemView {
     selection-background-color: #2979FF;
     border: 1px solid #4A4A4A;
 }
+
+QDateEdit::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 18px;
+    border-left: 1px solid #4A4A4A;
+    background-color: #3C3C3C;
+    border-top-right-radius: 3px;
+    border-bottom-right-radius: 3px;
+}
+QDateEdit::drop-down:hover { background-color: #4A4A4A; }
+QDateEdit::down-arrow {
+    image: __DOWN_ARROW__;
+    width: 14px;
+    height: 14px;
+}
+
+QCalendarWidget QWidget#qt_calendar_navigationbar { background-color: #333333; }
+QCalendarWidget QToolButton {
+    background-color: transparent;
+    color: #E0E0E0;
+    border: none;
+    padding: 2px 6px;
+}
+QCalendarWidget QToolButton:hover {
+    background-color: #4A4A4A;
+    border-radius: 3px;
+}
+QCalendarWidget QAbstractItemView {
+    background-color: #242424;
+    color: #E0E0E0;
+    selection-background-color: #2979FF;
+    selection-color: #FFFFFF;
+    outline: none;
+}
+QCalendarWidget QAbstractItemView:disabled { color: #6B6B6B; }
+QCalendarWidget QMenu { background-color: #2B2B2B; color: #E0E0E0; }
 
 QCheckBox { color: #E0E0E0; spacing: 6px; }
 QCheckBox::indicator {
@@ -268,11 +305,40 @@ def is_dark() -> bool:
     return _current == DARK
 
 
+def _dark_palette():
+    """深色主题的调色板，兜住 QSS 没覆盖到的部件（日历、菜单、表头等）。"""
+    from PyQt5.QtGui import QColor, QPalette
+
+    text = QColor("#E0E0E0")
+    pal = QPalette()
+    pal.setColor(QPalette.Window, QColor("#1E1E1E"))
+    pal.setColor(QPalette.WindowText, text)
+    pal.setColor(QPalette.Base, QColor("#2B2B2B"))
+    pal.setColor(QPalette.AlternateBase, QColor("#242424"))
+    pal.setColor(QPalette.ToolTipBase, QColor("#2B2B2B"))
+    pal.setColor(QPalette.ToolTipText, text)
+    pal.setColor(QPalette.Text, text)
+    pal.setColor(QPalette.Button, QColor("#3C3C3C"))
+    pal.setColor(QPalette.ButtonText, text)
+    pal.setColor(QPalette.BrightText, QColor("#FFFFFF"))
+    pal.setColor(QPalette.Highlight, QColor("#2979FF"))
+    pal.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
+    pal.setColor(QPalette.Link, QColor("#64B5F6"))
+    pal.setColor(QPalette.PlaceholderText, QColor("#808080"))
+    for role in (QPalette.Text, QPalette.ButtonText, QPalette.WindowText):
+        pal.setColor(QPalette.Disabled, role, QColor("#777777"))
+    return pal
+
+
 def apply_theme(app, theme: str) -> None:
     """把主题应用到整个应用；传入 LIGHT 或 DARK。"""
     global _current
     _current = DARK if theme == DARK else LIGHT
     app.setStyle("Fusion")
+    if _current == DARK:
+        app.setPalette(_dark_palette())
+    else:
+        app.setPalette(app.style().standardPalette())
     app.setStyleSheet(_dark_qss() if _current == DARK else _LIGHT_QSS)
 
 
